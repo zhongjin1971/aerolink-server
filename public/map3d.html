@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cesium Map</title>
+<script src="/Cesium/Cesium.js"></script>
+<style>
+  @import url(/Cesium/Widgets/widgets.css);
+  html, body, #cesiumContainer { width:100%; height:100%; margin:0; padding:0; overflow:hidden; }
+</style>
+</head>
+<body>
+<div id="cesiumContainer"></div>
+<script>
+// ── Cesium viewer ──────────────────────────────────────────────────────────
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  animation: true,
+  shouldAnimate: true,
+  timeline: true,
+  geocoder: false,
+  fullscreenButton: true,
+  navigationHelpButton: false,
+  homeButton: true,
+  baseLayerPicker: false,
+  sceneModePicker: false,
+  terrainProviderViewModels: [],
+});
+viewer.scene.globe.depthTestAgainstTerrain = false;
+
+// ── CZML data source ───────────────────────────────────────────────────────
+const czmlStream = new Cesium.CzmlDataSource();
+viewer.dataSources.add(czmlStream);
+
+// ── glTF animation helpers (unchanged from original map3d.html) ────────────
+function getActiveAnimations(viewer, entity) {
+  const primitives = viewer.scene.primitives;
+  for (let i = 0; i < primitives.length; i++) {
+    const prim = primitives.get(i);
+    if (prim.id === entity && prim instanceof Cesium.Model && prim.ready) {
+      return prim.activeAnimations;
+    }
+  }
+  return undefined;
+}
+
+function playAnimation(viewer, command, retries) {
+  const entity = czmlStream.entities.getById(command.id);
+  if (entity !== undefined) {
+    const animations = getActiveAnimations(viewer, entity);
+    if (animations !== undefined) {
+      try {
+        const options = {
+          name: command.animation,
+          startOffset: command.startOffset,
+          reverse: command.reverse,
+          loop: command.loop ? Cesium.ModelAnimationLoop.REPEAT : Cesium.ModelAnimationLoop.NONE,
+          multiplier: command.multiplier,
+        };
+        options.startTime = Cesium.JulianDate.fromIso8601(command.startDateTime);
+        if (Cesium.JulianDate.compare(options.startTime, viewer.clock.currentTime) < 0) {
+          options.startTime = viewer.clock.currentTime;
+        }
+        if (command.duration !== 0) {
+          options.stopTime = Cesium.JulianDate.addSeconds(options.startTime, command.duration, new Cesium.JulianDate());
+        }
+        animations.add(options);
+      } catch (e) {
+        if (retries > 0) setTimeout(() => playAnimation(viewer, command, retries - 1), 200);
+      }
+    } else {
+      if (retries > 0) setTimeout(() => playAnimation(viewer, command, retries - 1), 200);
+    }
+  } else {
+    if (retries > 0) setTimeout(() => playAnimation(viewer, command, retries - 1), 200);
+  }
+}
+
+// ── WebSocket — connect back to same server, dynamic port ─────────────────
+// URL param ?ws=PORT overrides auto-detect (useful in proxied deployments)
+const wsPort = new URLSearchParams(location.search).get('ws') || location.port || 80;
+const socket = new WebSocket(`ws://${location.hostname}:${wsPort}`);
+
+socket.onopen = () => console.log('[ws] connected');
+socket.onclose = () => console.warn('[ws] disconnected');
+
+socket.onmessage = (event) => {
+  let command;
+  try { command = JSON.parse(event.data); }
+  catch (e) { console.error('[ws] bad JSON', e); return; }
+
+  try {
+    switch (command.command) {
+
+      case 'czml':
+        processCZML(command);
+        break;
+
+      case 'removeAllCZMLEntities':
+        czmlStream.entities.removeAll();
+        break;
+
+      case 'trackId': {
+        const entity = czmlStream.entities.getById(command.id);
+        viewer.trackedEntity = entity || undefined;
+        break;
+      }
+
+      case 'setHomeView':
+        Cesium.Camera.DEFAULT_VIEW_RECTANGLE = Cesium.Rectangle.fromDegrees(
+          command.longitude - command.angle, command.latitude - command.angle,
+          command.longitude + command.angle, command.latitude + command.angle
+        );
+        Cesium.Camera.DEFAULT_VIEW_FACTOR = 0.0;
+        viewer.camera.flyHome(0);
+        break;
+
+      case 'setView':
+        viewer.scene.camera.setView({
+          destination: Cesium.Cartesian3.fromDegrees(command.longitude, command.latitude, command.altitude),
+          orientation: { heading: 0 },
+        });
+        break;
+
+      case 'setDateTime':
+        viewer.clock.currentTime = Cesium.JulianDate.fromIso8601(command.dateTime);
+        break;
+
+      case 'playAnimation':
+        if (command.stop) {
+          // stop: find and remove
+          const entity = czmlStream.entities.getById(command.id);
+          if (entity) {
+            const animations = getActiveAnimations(viewer, entity);
+            if (animations) {
+              for (const a of [...animations._animationAdded._listeners]) { /* no public stop-by-name API */ }
+              // Simplest approach: remove all animations by name
+              animations.removeAll();
+            }
+          }
+        } else {
+          playAnimation(viewer, command, 30);
+        }
+        break;
+
+      case 'setSunLight':
+        viewer.scene.globe.enableLighting = command.useSunLight;
+        if (!command.useSunLight) {
+          viewer.scene.light = new Cesium.DirectionalLight({ direction: new Cesium.Cartesian3(1, 0, 0) });
+          viewer.scene.preRender.addEventListener((scene) => {
+            scene.light.direction = Cesium.Cartesian3.clone(scene.camera.directionWC, scene.light.direction);
+          });
+        }
+        break;
+
+      case 'setCameraReferenceFrame':
+        viewer.scene.postUpdate.removeEventListener(viewer._eciListener);
+        if (command.eci) {
+          viewer._eciListener = (scene, time) => {
+            const icrfToFixed = Cesium.Transforms.computeIcrfToFixedMatrix(time);
+            if (icrfToFixed) Cesium.Matrix4.fromRotationTranslation(icrfToFixed, Cesium.Cartesian3.ZERO, scene.camera.transform);
+          };
+          viewer.scene.postUpdate.addEventListener(viewer._eciListener);
+        }
+        break;
+
+      case 'setTerrain':
+        (async () => {
+          if (command.provider === 'Ellipsoid') {
+            viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+          } else {
+            try {
+              viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromUrl(command.url || Cesium.IonResource.fromAssetId(1));
+            } catch (e) {
+              console.warn('Terrain load failed', e);
+            }
+          }
+        })();
+        break;
+
+      case 'setBuildings':
+        if (command.show) {
+          Cesium.Cesium3DTileset.fromIonAssetId(96188).then(ts => viewer.scene.primitives.add(ts));
+        }
+        break;
+
+      default:
+        console.log('[ws] unknown command', command.command);
+    }
+  } catch (e) {
+    console.error('[ws] error handling command', command.command, e);
+  }
+};
+
+// ── CZML processing with CLIP_TO_GROUND workaround ────────────────────────
+function processCZML(command) {
+  // Custom CLIP_TO_GROUND (workaround for Cesium bug #4049)
+  if (command.altitudeReference === 'CLIP_TO_GROUND' &&
+      command.position?.cartographicDegrees) {
+    const coords = command.position.cartographicDegrees;
+    const size = coords.length;
+    // Single position: [lon, lat, alt] or [dt, lon, lat, alt]
+    const offset = (size === 3 || size === 4) ? (size === 3 ? 2 : 3) : -1;
+    if (offset >= 0 && !(viewer.terrainProvider instanceof Cesium.EllipsoidTerrainProvider)) {
+      const lon = coords[offset - 2], lat = coords[offset - 1], h = coords[offset];
+      const pos = Cesium.Cartographic.fromDegrees(lon, lat);
+      Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, [pos]).then(([updated]) => {
+        if (h < updated.height) coords[offset] = updated.height;
+        czmlStream.process(command);
+      }).catch(() => czmlStream.process(command));
+      return;
+    }
+  }
+  czmlStream.process(command);
+}
+
+// ── Report selection/tracking events back to server ───────────────────────
+viewer.screenSpaceEventHandler.setInputAction((click) => {
+  const picked = viewer.scene.pick(click.position);
+  const entity = picked?.id instanceof Cesium.Entity ? picked.id : null;
+  socket.send(JSON.stringify({ event: 'selected', id: entity?.id || null }));
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+// Report clock changes (other plugins can sync to the timeline)
+function reportClock() {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({
+      event: 'clock',
+      currentTime: Cesium.JulianDate.toIso8601(viewer.clock.currentTime),
+      shouldAnimate: viewer.clock.shouldAnimate,
+      multiplier: viewer.clock.multiplier,
+    }));
+  }
+}
+Cesium.knockout.getObservable(viewer.clockViewModel, 'shouldAnimate').subscribe(reportClock);
+Cesium.knockout.getObservable(viewer.clockViewModel, 'multiplier').subscribe(reportClock);
+</script>
+</body>
+</html>
